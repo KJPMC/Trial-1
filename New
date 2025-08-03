@@ -1,4 +1,243 @@
-import torch
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.datasets import make_classification
+from sklearn.metrics.pairwise import cosine_similarity
+import shap
+import matplotlib.pyplot as plt
+from typing import Dict
+import warnings
+warnings.filterwarnings('ignore')
+
+def analyze_sign_consistency(model, X_data, target_idx, n_similar=5):
+    """
+    Simple function to check if SHAP explanations have consistent signs 
+    across similar data points.
+    
+    Parameters:
+    -----------
+    model: trained XGBoost model
+    X_data: your dataset (numpy array or pandas DataFrame)
+    target_idx: index of point to analyze
+    n_similar: how many similar points to compare (default=5)
+    
+    Returns:
+    --------
+    Dictionary with easy-to-understand results
+    """
+    
+    # Convert to numpy if needed
+    if hasattr(X_data, 'values'):
+        X_data = X_data.values
+    
+    # Step 1: Find similar points using cosine similarity
+    target_point = X_data[target_idx:target_idx+1]
+    similarities = cosine_similarity(target_point, X_data)[0]
+    similarities[target_idx] = -1  # Exclude target point itself
+    similar_indices = np.argsort(similarities)[::-1][:n_similar]
+    
+    # Step 2: Get SHAP values for these similar points
+    explainer = shap.TreeExplainer(model)
+    similar_points = X_data[similar_indices]
+    shap_values = explainer.shap_values(similar_points)
+    
+    # Handle multi-class output
+    if isinstance(shap_values, list):
+        shap_values = shap_values[0]
+    
+    # Step 3: Analyze signs
+    results = _calculate_simple_metrics(shap_values, similar_indices, target_idx)
+    
+    return results
+
+def _calculate_simple_metrics(shap_values, similar_indices, target_idx):
+    """Calculate simple, interpretable sign consistency metrics."""
+    
+    n_points, n_features = shap_values.shape
+    
+    # Get signs: +1 for positive, -1 for negative, 0 for zero
+    signs = np.sign(shap_values)
+    
+    # 1. Overall consistency: how often do features have same sign?
+    total_agreements = 0
+    total_comparisons = 0
+    
+    for i in range(n_points):
+        for j in range(i+1, n_points):
+            agreements = np.sum(signs[i] == signs[j])
+            total_agreements += agreements
+            total_comparisons += n_features
+    
+    overall_consistency = total_agreements / total_comparisons if total_comparisons > 0 else 0
+    
+    # 2. Feature-level consistency: for each feature, what % of points have same sign?
+    feature_consistency = []
+    feature_names = [f'Feature_{i}' for i in range(n_features)]
+    
+    for feature_idx in range(n_features):
+        feature_signs = signs[:, feature_idx]
+        unique_signs, counts = np.unique(feature_signs, return_counts=True)
+        most_common_count = np.max(counts)
+        consistency = most_common_count / n_points
+        feature_consistency.append(consistency)
+    
+    # 3. Problem features: which features flip signs?
+    problem_features = []
+    stable_features = []
+    
+    for feature_idx in range(n_features):
+        feature_signs = signs[:, feature_idx]
+        unique_signs = np.unique(feature_signs)
+        
+        if len(unique_signs) == 1:
+            stable_features.append(feature_idx)
+        else:
+            problem_features.append(feature_idx)
+    
+    # 4. Simple interpretation
+    if overall_consistency >= 0.8:
+        interpretation = "EXCELLENT: Signs are very consistent"
+    elif overall_consistency >= 0.6:
+        interpretation = "GOOD: Signs are mostly consistent"
+    elif overall_consistency >= 0.4:
+        interpretation = "MODERATE: Some sign inconsistencies"
+    else:
+        interpretation = "POOR: Many sign inconsistencies"
+    
+    return {
+        'overall_consistency': overall_consistency,
+        'interpretation': interpretation,
+        'feature_consistency': feature_consistency,
+        'feature_names': feature_names,
+        'stable_features': stable_features,
+        'problem_features': problem_features,
+        'similar_points': similar_indices,
+        'target_point': target_idx,
+        'sign_matrix': signs,
+        'shap_values': shap_values
+    }
+
+def print_results(results):
+    """Print results in a simple, readable format."""
+    
+    print("="*50)
+    print("SIGN CONSISTENCY ANALYSIS")
+    print("="*50)
+    
+    print(f"Target Point: {results['target_point']}")
+    print(f"Similar Points: {results['similar_points']}")
+    print(f"\nOverall Consistency: {results['overall_consistency']:.2f}")
+    print(f"Interpretation: {results['interpretation']}")
+    
+    print(f"\nStable Features (same sign for all points): {len(results['stable_features'])}")
+    if results['stable_features']:
+        print(f"  Features: {results['stable_features']}")
+    
+    print(f"\nProblem Features (sign flips): {len(results['problem_features'])}")
+    if results['problem_features']:
+        print(f"  Features: {results['problem_features']}")
+    
+    print("\nFeature-by-Feature Consistency:")
+    for i, (name, consistency) in enumerate(zip(results['feature_names'], results['feature_consistency'])):
+        status = "✓" if consistency == 1.0 else "⚠" if consistency >= 0.6 else "✗"
+        print(f"  {status} {name}: {consistency:.2f}")
+
+def plot_simple_visualization(results):
+    """Create simple, easy-to-understand plots."""
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Plot 1: Sign matrix
+    signs = results['sign_matrix']
+    n_points, n_features = signs.shape
+    
+    # Create color map: red for negative, white for zero, blue for positive
+    colors = np.where(signs == -1, 'red', np.where(signs == 0, 'white', 'blue'))
+    
+    for i in range(n_points):
+        for j in range(n_features):
+            color = 'red' if signs[i,j] == -1 else 'white' if signs[i,j] == 0 else 'blue'
+            ax1.add_patch(plt.Rectangle((j, i), 1, 1, facecolor=color, edgecolor='black'))
+            ax1.text(j+0.5, i+0.5, f'{signs[i,j]:+.0f}', ha='center', va='center', fontweight='bold')
+    
+    ax1.set_xlim(0, n_features)
+    ax1.set_ylim(0, n_points)
+    ax1.set_xlabel('Features')
+    ax1.set_ylabel('Similar Points')
+    ax1.set_title('Sign Matrix\n(Red: Negative, Blue: Positive, White: Zero)')
+    ax1.set_xticks(range(n_features))
+    ax1.set_yticks(range(n_points))
+    
+    # Plot 2: Feature consistency scores
+    consistency_scores = results['feature_consistency']
+    colors = ['green' if score == 1.0 else 'orange' if score >= 0.6 else 'red' 
+              for score in consistency_scores]
+    
+    bars = ax2.bar(range(len(consistency_scores)), consistency_scores, color=colors)
+    ax2.axhline(y=0.8, color='darkgreen', linestyle='--', alpha=0.7, label='Excellent (0.8+)')
+    ax2.axhline(y=0.6, color='orange', linestyle='--', alpha=0.7, label='Good (0.6+)')
+    ax2.set_xlabel('Feature Index')
+    ax2.set_ylabel('Consistency Score')
+    ax2.set_title('Feature Sign Consistency\n(Higher = More Consistent)')
+    ax2.set_ylim(0, 1.1)
+    ax2.legend()
+    
+    # Add value labels on bars
+    for i, (bar, score) in enumerate(zip(bars, consistency_scores)):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02, 
+                f'{score:.2f}', ha='center', va='bottom', fontsize=9)
+    
+    plt.tight_layout()
+    plt.show()
+
+def create_xgboost_example():
+    """Create a simple XGBoost example to test the function."""
+    
+    print("Creating sample dataset and training XGBoost model...")
+    
+    # Generate sample data
+    X, y = make_classification(n_samples=500, n_features=8, n_informative=6, 
+                             n_redundant=1, random_state=42)
+    
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+    
+    # Train XGBoost
+    model = xgb.XGBClassifier(n_estimators=50, max_depth=4, random_state=42)
+    model.fit(X_train, y_train)
+    
+    print(f"Model trained! Accuracy: {model.score(X_test, y_test):.3f}")
+    
+    return model, X_test, y_test
+
+# Simple example usage
+if __name__ == "__main__":
+    
+    # Create example model and data
+    model, X_test, y_test = create_xgboost_example()
+    
+    # Test the function
+    target_point = 10  # Choose any point index
+    
+    print(f"\nAnalyzing sign consistency for point {target_point}...")
+    results = analyze_sign_consistency(model, X_test, target_point, n_similar=5)
+    
+    # Print results
+    print_results(results)
+    
+    # Show visualization
+    plot_simple_visualization(results)
+    
+    # Quick check multiple points
+    print("\nQuick check on multiple points:")
+    for idx in [5, 15, 25, 35]:
+        if idx < len(X_test):
+            result = analyze_sign_consistency(model, X_test, idx, n_similar=5)
+            print(f"Point {idx:2d}: {result['overall_consistency']:.2f} - {result['interpretation']}")
+
+
+#################import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
